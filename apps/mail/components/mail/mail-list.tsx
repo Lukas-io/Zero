@@ -20,31 +20,32 @@ import {
   parseNaturalLanguageSearch,
 } from '@/lib/utils';
 import {
-  type ComponentProps,
   memo,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
+  type ComponentProps,
 } from 'react';
 import type { ConditionalThreadProps, MailListProps, MailSelectMode, ParsedMessage } from '@/types';
+import { useOptimisticThreadState } from '@/components/mail/optimistic-thread-state';
+import { focusedIndexAtom, useMailNavigation } from '@/hooks/use-mail-navigation';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { moveThreadsTo, type ThreadDestination } from '@/lib/thread-actions';
 import { Briefcase, Check, Star, StickyNote, Users } from 'lucide-react';
 import { ThreadContextMenu } from '@/components/context/thread-context';
+import { useOptimisticActions } from '@/hooks/use-optimistic-actions';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar';
 import { useMail, type Config } from '@/components/mail/use-mail';
-import { useMailNavigation } from '@/hooks/use-mail-navigation';
-import { focusedIndexAtom } from '@/hooks/use-mail-navigation';
 import { backgroundQueueAtom } from '@/store/backgroundQueue';
+import type { ThreadDestination } from '@/lib/thread-actions';
 import { useThread, useThreads } from '@/hooks/use-threads';
-import { useAISidebar } from '@/components/ui/ai-sidebar';
 import { useSearchValue } from '@/hooks/use-search-value';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { highlightText } from '@/lib/email-utils.client';
 import { useHotkeysContext } from 'react-hotkeys-hook';
+import { motion, AnimatePresence } from 'motion/react';
 import { useParams, useNavigate } from 'react-router';
 import { useTRPC } from '@/providers/query-provider';
 import { useThreadLabels } from '@/hooks/use-labels';
@@ -200,6 +201,9 @@ const Thread = memo(
       }
     }, [getThreadData?.latest?.tags]);
 
+    // Import the optimistic actions hook
+    const { optimisticToggleStar } = useOptimisticActions();
+
     const handleToggleStar = useCallback(
       async (e: React.MouseEvent) => {
         e.stopPropagation();
@@ -207,15 +211,9 @@ const Thread = memo(
 
         const newStarredState = !isStarred;
         setIsStarred(newStarredState);
-        if (newStarredState) {
-          toast.success(t('common.actions.addedToFavorites'));
-        } else {
-          toast.success(t('common.actions.removedFromFavorites'));
-        }
-        await toggleStar({ ids: [message.id] });
-        await refetchThread();
+        await optimisticToggleStar([message.id], newStarredState);
       },
-      [getThreadData, message.id, isStarred, refetchThreads, t],
+      [getThreadData, message.id, isStarred, optimisticToggleStar],
     );
 
     const handleToggleImportant = useCallback(
@@ -250,43 +248,39 @@ const Thread = memo(
       [threads, id, focusedIndex],
     );
 
+    // Use the optimistic move function
+    const { optimisticMoveThreadsTo } = useOptimisticActions();
+
     const moveThreadTo = useCallback(
       async (destination: ThreadDestination) => {
         if (!message.id) return;
-        const promise = moveThreadsTo({
-          threadIds: [message.id],
-          currentFolder: folder,
-          destination,
-        });
-        setBackgroundQueue({ type: 'add', threadId: `thread:${message.id}` });
         handleNext(message.id);
-        toast.success(
-          destination === 'inbox'
-            ? t('common.actions.movedToInbox')
-            : destination === 'spam'
-              ? t('common.actions.movedToSpam')
-              : destination === 'bin'
-                ? t('common.actions.movedToBin')
-                : t('common.actions.archived'),
-        );
-        toast.promise(promise, {
-          error: t('common.actions.failedToMove'),
-          finally: async () => {
-            await Promise.all([
-              refetchStats(),
-              refetchThreads(),
-              queryClient.invalidateQueries({
-                queryKey: trpc.mail.get.queryKey({ id: message.id }),
-              }),
-            ]);
-          },
-        });
+        await optimisticMoveThreadsTo([message.id], folder, destination);
       },
-      [message.id, folder, t, setBackgroundQueue, refetchStats, refetchThreads],
+      [message.id, folder, optimisticMoveThreadsTo, handleNext],
     );
 
     const latestMessage = demo ? demoMessage : getThreadData?.latest;
     const emailContent = demo ? demoMessage?.body : getThreadData?.latest?.body;
+
+    // Get optimistic state for this thread - only if we have a valid message ID
+    const optimisticState = message.id
+      ? useOptimisticThreadState(message.id)
+      : useMemo(
+          () => ({
+            isMoving: false,
+            isStarring: false,
+            isMarkingAsRead: false,
+            isAddingLabel: false,
+            isRemoving: false,
+            shouldHide: false,
+            optimisticStarred: null,
+            optimisticRead: null,
+            optimisticDestination: null,
+            hasOptimisticState: false,
+          }),
+          [],
+        );
 
     const { labels: threadLabels } = useThreadLabels(
       getThreadData?.labels ? getThreadData.labels.map((l) => l.id) : [],
@@ -376,7 +370,12 @@ const Thread = memo(
                     <div className="flex flex-row items-center gap-1">
                       <p
                         className={cn(
-                          latestMessage.unread && !isMailSelected ? 'font-bold' : 'font-medium',
+                          // Use optimistic read state if available
+                          (optimisticState.optimisticRead !== null
+                            ? !optimisticState.optimisticRead
+                            : latestMessage.unread) && !isMailSelected
+                            ? 'font-bold'
+                            : 'font-medium',
                           'text-md flex items-baseline gap-1 group-hover:opacity-100',
                         )}
                       >
@@ -386,7 +385,10 @@ const Thread = memo(
                             searchValue.highlight,
                           )}
                         </span>{' '}
-                        {latestMessage.unread && !isMailSelected ? (
+                        {/* Show unread indicator based on optimistic state if available */}
+                        {(optimisticState.optimisticRead !== null
+                          ? !optimisticState.optimisticRead
+                          : latestMessage.unread) && !isMailSelected ? (
                           <span className="size-2 rounded bg-[#006FFE]" />
                         ) : null}
                       </p>
@@ -442,6 +444,9 @@ const Thread = memo(
       ) : null;
 
     if (demo) return demoContent;
+
+    // If this thread has an optimistic action that should hide it, don't render it
+    // We'll handle this with AnimatePresence instead of returning null immediately
 
     const content =
       latestMessage && getThreadData ? (
@@ -696,17 +701,35 @@ const Thread = memo(
       ) : null;
 
     return latestMessage ? (
-      <ThreadWrapper
-        emailId={message.id}
-        threadId={latestMessage.threadId ?? message.id}
-        isFolderInbox={isFolderInbox}
-        isFolderSpam={isFolderSpam}
-        isFolderSent={isFolderSent}
-        isFolderBin={isFolderBin}
-        refreshCallback={() => refetchThreads()}
-      >
-        {content}
-      </ThreadWrapper>
+      <AnimatePresence mode="sync">
+        {!optimisticState.shouldHide && (
+          <motion.div
+            key={message.id}
+            initial={{ opacity: 1, height: 'auto' }}
+            exit={{
+              opacity: 0,
+              height: 0,
+              marginTop: 0,
+              marginBottom: 0,
+              overflow: 'hidden',
+              transition: { duration: 0.3, ease: 'easeInOut' },
+            }}
+            layout
+          >
+            <ThreadWrapper
+              emailId={message.id}
+              threadId={latestMessage.threadId ?? message.id}
+              isFolderInbox={isFolderInbox}
+              isFolderSpam={isFolderSpam}
+              isFolderSent={isFolderSent}
+              isFolderBin={isFolderBin}
+              refreshCallback={() => refetchThreads()}
+            >
+              {content}
+            </ThreadWrapper>
+          </motion.div>
+        )}
+      </AnimatePresence>
     ) : null;
   },
 );
@@ -986,46 +1009,79 @@ export const MailList = memo(({ isCompact }: MailListProps) => {
             </div>
           ) : (
             <div className="flex flex-col md:gap-2" id="mail-list-scroll">
-              {items
-                .filter((data) => data.id)
-                .map((data, index) => {
-                  if (!data || !data.id) return null;
-
-                  return isFolderDraft ? (
-                    <Draft key={`${data.id}-${index}`} message={{ id: data.id }} />
+              <AnimatePresence mode="popLayout">
+                {items
+                  .filter((data) => data.id)
+                  .map((data, index) => {
+                    if (!data || !data.id) return null;
+                    return isFolderDraft ? (
+                      <motion.div
+                        key={`${data.id}-${index}`}
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{
+                          opacity: 0,
+                          height: 0,
+                          marginTop: 0,
+                          marginBottom: 0,
+                          overflow: 'hidden',
+                        }}
+                        transition={{ duration: 0.2, ease: 'easeInOut' }}
+                        layout
+                      >
+                        <Draft key={`draft-${data.id}-${index}`} message={{ id: data.id }} />
+                      </motion.div>
+                    ) : (
+                      <motion.div
+                        key={`${data.id}-${index}`}
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{
+                          opacity: 0,
+                          height: 0,
+                          marginTop: 0,
+                          marginBottom: 0,
+                          overflow: 'hidden',
+                        }}
+                        transition={{ duration: 0.2, ease: 'easeInOut' }}
+                        layout
+                      >
+                        <Thread
+                          onClick={handleMailClick}
+                          selectMode={getSelectMode()}
+                          isCompact={isCompact}
+                          sessionData={sessionData}
+                          message={data}
+                          key={`thread-${data.id}-${index}`}
+                          isKeyboardFocused={focusedIndex === index && keyboardActive}
+                          isInQuickActionMode={isQuickActionMode && focusedIndex === index}
+                          selectedQuickActionIndex={quickActionIndex}
+                          resetNavigation={resetNavigation}
+                          index={index}
+                        />
+                      </motion.div>
+                    );
+                  })}
+              </AnimatePresence>
+              {items.length >= 9 && hasNextPage && !isFetching && (
+                <Button
+                  variant={'ghost'}
+                  className="w-full rounded-none"
+                  onMouseDown={handleScroll}
+                  disabled={isLoading}
+                >
+                  {isLoading ? (
+                    <div className="flex items-center gap-2">
+                      <div className="h-4 w-4 animate-spin rounded-full border-2 border-neutral-900 border-t-transparent dark:border-white dark:border-t-transparent" />
+                      {t('common.actions.loading')}
+                    </div>
                   ) : (
-                    <Thread
-                      onClick={handleMailClick}
-                      selectMode={getSelectMode()}
-                      isCompact={isCompact}
-                      sessionData={sessionData}
-                      message={data}
-                      key={`${data.id}-${index}`}
-                      isKeyboardFocused={focusedIndex === index && keyboardActive}
-                      isInQuickActionMode={isQuickActionMode && focusedIndex === index}
-                      selectedQuickActionIndex={quickActionIndex}
-                      resetNavigation={resetNavigation}
-                      index={index}
-                    />
-                  );
-                })}
-              <Button
-                variant={'ghost'}
-                className="w-full rounded-none"
-                onMouseDown={handleScroll}
-                disabled={isLoading || items.length <= 9 || !hasNextPage || isFetching}
-              >
-                {isLoading ? (
-                  <div className="flex items-center gap-2">
-                    <div className="h-4 w-4 animate-spin rounded-full border-2 border-neutral-900 border-t-transparent dark:border-white dark:border-t-transparent" />
-                    {t('common.actions.loading')}
-                  </div>
-                ) : (
-                  <>
-                    {t('common.mail.loadMore')} <ChevronDown />
-                  </>
-                )}
-              </Button>
+                    <>
+                      {t('common.mail.loadMore')} <ChevronDown />
+                    </>
+                  )}
+                </Button>
+              )}
             </div>
           )}
         </ScrollArea>
